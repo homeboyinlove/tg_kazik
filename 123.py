@@ -1,11 +1,11 @@
-import random
 import logging
 import asyncio
-from aiogram import Bot, types
+from aiogram import Bot, Dispatcher, Router, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from aiogram import Dispatcher, Router
 from aiogram.filters import Command
-import requests
+from aiocryptopay import Networks, AioCryptoPay
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import json
 
 # Инициализация логирования
 logging.basicConfig(level=logging.INFO)
@@ -13,8 +13,11 @@ logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
 bot = Bot(token="8042451707:AAEFB7T27NS9NqhgrcYXRkOQQ1jbCMghIXE")
-dp = Dispatcher()  # Используем новый способ создания Dispatcher
-router = Router()  # Новый Router для обработки callback
+dp = Dispatcher()
+router = Router()
+
+# Инициализация клиента AioCryptoPay для криптовалютных платежей
+client = AioCryptoPay(token="296585:AAaiFPAMqpKsH6mPUXF83oorUQZb6igDxRt", network=Networks.MAIN_NET)
 
 # Пример комнаты
 rooms = {
@@ -25,145 +28,290 @@ rooms = {
     'room_5': {"stake": 25, "player_1": None, "player_2": None},
 }
 
-# Ваш API-ключ для CryptoBot
-CRYPTOBOT_API_KEY = '296585:AAaiFPAMqpKsH6mPUXF83oorUQZb6igDxRt'
+# Работа с данными пользователей в JSON
+def load_data():
+    try:
+        with open("user_profiles.json", "r") as file:
+            content = file.read().strip()
+            if not content:
+                return {"users": {}}
+            return json.loads(content)
+    except FileNotFoundError:
+        return {"users": {}}
+    except json.JSONDecodeError:
+        logger.error("Error decoding JSON from the file, resetting file content.")
+        return {"users": {}}
 
+def save_data(data):
+    with open("user_profiles.json", "w") as file:
+        json.dump(data, file, indent=4)
 
-# Функция для получения адреса депозита через API CryptoBot
-def get_crypto_deposit_address(currency='USDT', blockchain='ERC20'):
-    url = f'https://pay.crypt.bot/api/get_deposit_address'
-    headers = {
-        'Crypto-Pay-API-Token': CRYPTOBOT_API_KEY  # API-ключ в заголовке
-    }
-    params = {
-        'currency': 'USDT',  # Например, USDT
-        'blockchain': 'ERC-20'  # Например, ERC-20
-    }
-    response = requests.get(url, params=params, headers=headers)
+def add_new_user(user_id):
+    data = load_data()
+    if str(user_id) not in data["users"]:
+        data["users"][str(user_id)] = {
+            "tg_id": user_id,
+            "balance": 0.0,
+            "deposits": []
+        }
+        save_data(data)
+        return True
+    return False
 
-    if response.status_code == 200:
-        data = response.json()
-        return data.get('address', None)  # Возвращаем адрес для депозита
-    else:
-        logger.error(f"Ошибка при запросе адреса депозита: {response.status_code}, {response.text}")
-        return None  # Если не удалось получить адрес, возвращаем None
-
-# Генерация клавиатуры с комнатами
-def generate_rooms_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    for room_id, room in rooms.items():
-        # Проверяем, сколько игроков в комнате
-        players_in_room = sum([1 for player in [room["player_1"], room["player_2"]] if player is not None])
-        status = f"{players_in_room}/2"  # Статус комнаты в формате 1/2 или 0/2
-        keyboard.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"Комната {room_id[-1]}: {room['stake']}$ ({status})",
-                callback_data=f"join_{room_id}"  # Передаем room_id через callback_data
-            )
-        ])
+def generate_main_menu_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Выбрать комнату", callback_data="rooms")],
+        [InlineKeyboardButton(text="Внести депозит", callback_data="deposit")],
+        [InlineKeyboardButton(text="Вывести средства", callback_data="withdraw")],
+    ])
     return keyboard
 
+def generate_rooms_keyboard(user_id=None):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    for room_id, room in rooms.items():
+        players_in_room = sum([1 for player in [room["player_1"], room["player_2"]] if player is not None])
+        status = f"{players_in_room}/2"
+        keyboard.inline_keyboard.append([InlineKeyboardButton(
+            text=f"Комната {room_id[-1]}: {room['stake']}$ ({status})",
+            callback_data=f"join_{room_id}")])
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="Выбрать депозит", callback_data="choose_deposit")])
+    if user_id:
+        user_data = load_data()
+        user_profile = user_data.get("users", {}).get(str(user_id), {})
+        balance = user_profile.get("balance", 0)
+        if balance > 0:
+            keyboard.inline_keyboard.append(
+                [InlineKeyboardButton(text="Вывести средства на Cryptobot", callback_data="withdraw_funds")])
+    return keyboard
 
-# Обработчик команды /start
-@router.message(Command("start"))
-async def start_handler(message: types.Message):
-    keyboard = generate_rooms_keyboard()
-    await message.answer("Выберите комнату для игры:", reply_markup=keyboard)
+def generate_withdraw_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Вывести средства на Cryptobot", callback_data="withdraw_funds")],
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_rooms")]
+    ])
 
+def generate_deposit_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="5 USDT", callback_data="choose_deposit_5")],
+        [InlineKeyboardButton(text="10 USDT", callback_data="choose_deposit_10")],
+        [InlineKeyboardButton(text="20 USDT", callback_data="choose_deposit_20")],
+        [InlineKeyboardButton(text="50 USDT", callback_data="choose_deposit_50")],
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_rooms")],
+    ])
 
-# Обработчик нажатия на кнопку
+@router.callback_query(lambda c: c.data == "rooms")
+async def rooms_handler(callback_query: CallbackQuery):
+    keyboard = generate_rooms_keyboard(callback_query.from_user.id)
+    await callback_query.message.answer("Выберите комнату:", reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data == "deposit")
+async def deposit_handler(callback_query: CallbackQuery):
+    keyboard = generate_deposit_keyboard()
+    await callback_query.message.answer("Выберите депозит:", reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data == "withdraw")
+async def withdraw_handler(callback_query: CallbackQuery):
+    keyboard = generate_withdraw_keyboard()
+    await callback_query.message.answer("Выберите действие для вывода средств:", reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data == "withdraw_funds")
+async def withdraw_funds_handler(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    user_data = load_data()
+    user_profile = user_data.get("users", {}).get(str(user_id), {})
+    balance = user_profile.get("balance", 0)
+    if balance > 0:
+        await callback_query.message.answer(f"Ваш баланс: {balance} USDT. Введите сумму для вывода:")
+    else:
+        await callback_query.message.answer("У вас недостаточно средств для вывода.")
+
+@router.message(lambda message: message.text.isdigit())
+async def process_withdrawal_request(message: types.Message):
+    user_id = message.from_user.id
+    withdrawal_amount = int(message.text)
+    user_data = load_data()
+    user_profile = user_data.get("users", {}).get(str(user_id), {})
+    balance = user_profile.get("balance", 0)
+    if withdrawal_amount <= balance:
+        user_profile["balance"] -= withdrawal_amount
+        save_data(user_data)
+
+        # Создание вывода средств через AioCryptoPay
+        invoice = await client.create_invoice(asset='USDT', amount=withdrawal_amount)
+        await message.answer(
+            f"Вы успешно вывели {withdrawal_amount} USDT. Ваш новый баланс: {user_profile['balance']} USDT. "
+            f"Ссылка для вывода: {invoice.bot_invoice_url}"
+        )
+    else:
+        await message.answer("Недостаточно средств для вывода.")
+
+@router.callback_query(lambda c: c.data == "back_to_rooms")
+async def back_to_rooms_handler(callback_query: CallbackQuery):
+    keyboard = generate_rooms_keyboard(callback_query.from_user.id)
+    await callback_query.message.answer("Выберите комнату для игры:", reply_markup=keyboard)
+
+@router.callback_query(lambda c: c.data.startswith("choose_deposit_"))
+async def deposit_handler(callback_query: CallbackQuery):
+    deposit = int(callback_query.data.split("_")[2])  # Извлекаем сумму депозита из callback data
+    await callback_query.message.answer(f"Вы выбрали депозит {deposit} USDT.")
+
+    # Создание счета для выбранного депозита
+    invoice = await client.create_invoice(asset='USDT', amount=deposit)
+
+    # Создание клавиатуры с кнопкой для оплаты
+    builder = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Оплатить {deposit} USDT", url=invoice.bot_invoice_url)],
+        [InlineKeyboardButton(text="Проверить оплату", callback_data=f"CHECK|{invoice.invoice_id}")]
+    ])
+
+    await callback_query.message.answer(
+        f"Вы выбрали депозит {deposit} USDT. Пожалуйста, используйте кнопку ниже для оплаты.",
+        reply_markup=builder
+    )
+
+@router.callback_query(lambda c: c.data.startswith("CHECK|"))
+async def check_invoice(call: CallbackQuery):
+    invoice_id = int(call.data.split("|")[1])
+    invoice = await client.get_invoices(invoice_id=invoice_id)
+    if invoice.status == "paid":
+        await call.message.delete()
+        await call.message.answer("Заказ оплачен!")
+        # Обновление баланса пользователя
+        user_id = call.from_user.id
+        user_data = load_data()
+        user_profile = user_data.get("users", {}).get(str(user_id), {})
+        user_profile["balance"] += invoice.amount
+        save_data(user_data)
+    else:
+        await call.answer("Оплата не обнаружена!")
+
+def check_balance(user_id, stake):
+    user_data = load_data()
+    user_profile = user_data.get("users", {}).get(str(user_id), {})
+    user_balance = user_profile.get("balance", 0)
+    if user_balance < stake:
+        return False
+    return True
+
 @router.callback_query(lambda c: c.data.startswith('join_'))
 async def join_room_handler(callback_query: CallbackQuery):
-    room_id = callback_query.data[5:]  # Извлекаем room_id из callback_data
+    room_id = callback_query.data[5:]
     if room_id in rooms:
         room = rooms[room_id]
+        stake = room["stake"]
+        user_id = callback_query.from_user.id
+        if not check_balance(user_id, stake):
+            await callback_query.message.answer(
+                f"У вас недостаточно средств для входа в комнату {room_id}. Пожалуйста, пополните баланс.")
+            return
         if room["player_1"] is None:
-            # Если нет первого игрока, присоединим его как player_1
-            room["player_1"] = callback_query.from_user.id
+            room["player_1"] = user_id
             await callback_query.message.answer(
-                f"Вы присоединились к комнате {room_id} с номиналом ставки {room['stake']}$")
+                f"Вы присоединились к комнате {room_id} с номиналом ставки {stake}$")
         elif room["player_2"] is None:
-            # Если есть первый игрок, но нет второго
-            room["player_2"] = callback_query.from_user.id
+            room["player_2"] = user_id
             await callback_query.message.answer(
-                f"Вы присоединились ко второй ячейке комнаты {room_id} с номиналом ставки {room['stake']}$")
-            await play_game(room_id)  # Запуск игры
+                f"Вы присоединились ко второй ячейке комнаты {room_id} с номиналом ставки {stake}$")
+            await play_game(room_id)
         else:
             await callback_query.message.answer(f"Комната {room_id} уже занята.")
     else:
         await callback_query.message.answer(f"Комната {room_id} не найдена.")
 
-
-# Функция для отправки анимированного кубика и получения результата
 async def dice_roll_animation(player_1, player_2):
-    # Отправляем анимированные кубики для игрока 1
     message_1 = await bot.send_dice(chat_id=player_1)
     result_1 = message_1.dice.value
-
-    # Отправляем анимированные кубики для игрока 2
     message_2 = await bot.send_dice(chat_id=player_2)
     result_2 = message_2.dice.value
-
     return result_1, result_2
 
+def deduct_balance(user_id, stake):
+    user_data = load_data()
+    user_profile = user_data.get("users", {}).get(str(user_id), {})
+    user_balance = user_profile.get("balance", 0)
+    if user_balance >= stake:
+        user_profile["balance"] -= stake
+        save_data(user_data)
+        return True
+    return False
 
-# Функция для подсчета победителя
+async def process_payment_confirmation(user_id, deposit_amount):
+    user_data = load_data()
+    user_profile = user_data["users"].get(str(user_id), {})
+    user_profile["balance"] += deposit_amount
+    save_data(user_data)
+    await bot.send_message(user_id, f"Ваш депозит {deposit_amount} USDT был зачислен на счет.")
+
 async def play_game(room_id):
     room = rooms[room_id]
     player_1 = room["player_1"]
     player_2 = room["player_2"]
-
-    # Отправляем анимированные кубики и получаем результаты
+    stake_1 = room["stake"]
+    stake_2 = room["stake"]
+    if player_1:
+        if not deduct_balance(player_1, stake_1):
+            await bot.send_message(player_1, "Недостаточно средств для игры.")
+            return
+    if player_2:
+        if not deduct_balance(player_2, stake_2):
+            await bot.send_message(player_2, "Недостаточно средств для игры.")
+            return
     result_1, result_2 = await dice_roll_animation(player_1, player_2)
-
-    # Подсчет победителя
     if result_1 > result_2:
-        winner = "Игрок 1"
+        winner = player_1
+        loser = player_2
+        prize = stake_2 * 0.8
     elif result_1 < result_2:
-        winner = "Игрок 2"
+        winner = player_2
+        loser = player_1
+        prize = stake_1 * 0.8
     else:
-        winner = "Ничья"
-
-    logger.info(
-        f"Игра в комнате {room_id} завершена. Победитель: {winner}. Результаты: Игрок 1 - {result_1}, Игрок 2 - {result_2}")
-
-    # Оповещаем игроков о победителе
-    await bot.send_message(player_1, f"Игра завершена! Ваш результат: {result_1}. Победитель: {winner}.")
-    await bot.send_message(player_2, f"Игра завершена! Ваш результат: {result_2}. Победитель: {winner}.")
-
-    # Очищаем комнату
+        winner = None
+        prize = 0
+    if winner:
+        user_data = load_data()
+        user_profile = user_data.get("users", {}).get(str(winner), {})
+        user_profile["balance"] += (stake_1 if winner == player_1 else stake_2) + prize
+        save_data(user_data)
+        await bot.send_message(winner,
+                               f"Вы выиграли! Ваш приз: {prize} USDT. Ваша ставка {stake_1 if winner == player_1 else stake_2} USDT возвращена.")
+        await bot.send_message(loser, f"Вы проиграли. Ваша ставка {room['stake']} USDT списана.")
+    else:
+        user_data = load_data()
+        if player_1:
+            user_profile_1 = user_data.get("users", {}).get(str(player_1), {})
+            user_profile_1["balance"] += stake_1
+        if player_2:
+            user_profile_2 = user_data.get("users", {}).get(str(player_2), {})
+            user_profile_2["balance"] += stake_2
+        save_data(user_data)
+        await bot.send_message(player_1, f"Ничья! Ваша ставка {stake_1} USDT возвращена.")
+        await bot.send_message(player_2, f"Ничья! Ваша ставка {stake_2} USDT возвращена.")
+    logger.info(f"Игра в комнате {room_id} завершена. Победитель: {winner}, Приз: {prize}.")
     room["player_1"] = None
     room["player_2"] = None
-
-    # Генерация клавиатуры с обновленными данными о комнатах
     keyboard = generate_rooms_keyboard()
-    # Обновляем сообщение с новой клавиатурой
-    await bot.send_message(player_1, "Игра завершена. Вы можете присоединиться к новой игре.", reply_markup=keyboard)
-    await bot.send_message(player_2, "Игра завершена. Вы можете присоединиться к новой игре.", reply_markup=keyboard)
+    if player_1:
+        await bot.send_message(player_1, "Игра завершена. Вы можете присоединиться к новой игре.",
+                               reply_markup=keyboard)
+    if player_2:
+        await bot.send_message(player_2, "Игра завершена. Вы можете присоединиться к новой игре.",
+                               reply_markup=keyboard)
 
-
-# Обработчик команды /deposit для получения адреса депозита
-@router.message(Command("deposit"))
-async def deposit(message: types.Message):
+@router.message(Command("start"))
+async def start_handler(message: types.Message):
     user_id = message.from_user.id
-    deposit_address = get_crypto_deposit_address()
-
-    if deposit_address:
-        await message.answer(
-            f"Для депозита отправьте криптовалюту на следующий адрес:\n{deposit_address}"
-        )
+    if add_new_user(user_id):
+        await message.answer("Добро пожаловать! Ваш профиль был создан.")
     else:
-        await message.answer("Не удалось получить адрес для депозита. Попробуйте позже.")
+        await message.answer("Вы уже зарегистрированы в системе.")
+    keyboard = generate_main_menu_keyboard()
+    await message.answer("Выберите действие:", reply_markup=keyboard)
 
-
-# Регистрация обработчиков в диспетчере
 dp.include_router(router)
 
-
-# Запуск бота с использованием asyncio
 async def on_start():
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(on_start())
