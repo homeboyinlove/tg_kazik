@@ -6,6 +6,7 @@ from aiogram.filters import Command
 from aiocryptopay import Networks, AioCryptoPay
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import json
+import uuid
 
 # Инициализация логирования
 logging.basicConfig(level=logging.INFO)
@@ -114,34 +115,61 @@ async def withdraw_handler(callback_query: CallbackQuery):
     keyboard = generate_withdraw_keyboard()
     await callback_query.message.answer("Выберите действие для вывода средств:", reply_markup=keyboard)
 
+import uuid  # Для генерации уникального spend_id
+
 @router.callback_query(lambda c: c.data == "withdraw_funds")
 async def withdraw_funds_handler(callback_query: CallbackQuery):
+    """Обработчик вывода средств."""
     user_id = callback_query.from_user.id
     user_data = load_data()
     user_profile = user_data.get("users", {}).get(str(user_id), {})
     balance = user_profile.get("balance", 0)
+
     if balance > 0:
-        await callback_query.message.answer(f"Ваш баланс: {balance} USDT. Введите сумму для вывода:")
+        await callback_query.message.answer(
+            f"Ваш баланс: {balance} USDT. Введите сумму для вывода:"
+        )
     else:
         await callback_query.message.answer("У вас недостаточно средств для вывода.")
 
 @router.message(lambda message: message.text.isdigit())
 async def process_withdrawal_request(message: types.Message):
+    """Обрабатывает запрос на вывод средств."""
     user_id = message.from_user.id
     withdrawal_amount = int(message.text)
     user_data = load_data()
     user_profile = user_data.get("users", {}).get(str(user_id), {})
     balance = user_profile.get("balance", 0)
+
     if withdrawal_amount <= balance:
+        # Списываем средства с баланса пользователя
         user_profile["balance"] -= withdrawal_amount
         save_data(user_data)
 
-        # Создание вывода средств через AioCryptoPay
-        invoice = await client.create_invoice(asset='USDT', amount=withdrawal_amount)
-        await message.answer(
-            f"Вы успешно вывели {withdrawal_amount} USDT. Ваш новый баланс: {user_profile['balance']} USDT. "
-            f"Ссылка для вывода: {invoice.bot_invoice_url}"
-        )
+        try:
+            # Генерация уникального spend_id
+            spend_id = str(uuid.uuid4())
+
+            # Выполняем перевод через Cryptobot API
+            transfer = await client.transfer(
+                user_id=user_id,  # Используем Telegram ID клиента
+                asset="USDT",
+                amount=withdrawal_amount,
+                spend_id=spend_id,
+            )
+
+            # Успешный перевод
+            await message.answer(
+                f"Вы успешно вывели {withdrawal_amount} USDT на ваш Cryptobot кошелек."
+            )
+        except Exception as e:
+            # Логируем ошибку и возвращаем баланс
+            logging.error(f"Ошибка при выводе средств: {e}")
+            user_profile["balance"] += withdrawal_amount
+            save_data(user_data)
+            await message.answer(
+                "Произошла ошибка при выводе средств. Попробуйте еще раз позже."
+            )
     else:
         await message.answer("Недостаточно средств для вывода.")
 
@@ -171,19 +199,30 @@ async def deposit_handler(callback_query: CallbackQuery):
 
 @router.callback_query(lambda c: c.data.startswith("CHECK|"))
 async def check_invoice(call: CallbackQuery):
-    invoice_id = int(call.data.split("|")[1])
-    invoice = await client.get_invoices(invoice_id=invoice_id)
-    if invoice.status == "paid":
+    invoice_id = int(call.data.split("|")[1])  # Извлекаем invoice_id из callback_data
+    # Получаем инвойс по ID с фильтрацией по статусу 'paid'
+    invoices = await client.get_invoices(invoice_ids=str(invoice_id), status="paid")
+
+    if invoices:
+        invoice = invoices[0]  # Получаем первый инвойс из списка
+        # Удаляем сообщение с кнопкой проверки
         await call.message.delete()
-        await call.message.answer("Заказ оплачен!")
-        # Обновление баланса пользователя
+
+        # Обновляем баланс пользователя
         user_id = call.from_user.id
         user_data = load_data()
         user_profile = user_data.get("users", {}).get(str(user_id), {})
-        user_profile["balance"] += invoice.amount
+        user_profile["balance"] += invoice.amount  # Добавляем сумму депозита на баланс
         save_data(user_data)
+
+        # Уведомление пользователя об успешной оплате
+        await call.message.answer(
+            f"Оплата прошла успешно! Ваш баланс был пополнен на {invoice.amount} USDT."
+        )
     else:
-        await call.answer("Оплата не обнаружена!")
+        # Если оплата не была найдена
+        await call.answer("Оплата не обнаружена. Пожалуйста, проверьте статус или повторите оплату.")
+
 
 def check_balance(user_id, stake):
     user_data = load_data()
